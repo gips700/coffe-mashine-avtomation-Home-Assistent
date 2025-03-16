@@ -1,0 +1,189 @@
+captive_portal:
+
+# Global variables for tracking fill cycles and error states
+globals:
+  - id: start_time
+    type: long
+    restore_value: no
+    initial_value: '0'
+
+  - id: filling
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: error_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: total_fills
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: total_liters
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  - id: boot_delay_complete
+    type: bool
+    restore_value: no
+    initial_value: 'false'  
+
+# Water level and tank presence sensors 
+binary_sensor:
+  - platform: gpio
+    pin: 21
+    id: upper_sensor
+    internal: true
+
+  - platform: gpio
+    pin: 3
+    id: lower_sensor
+    internal: true
+    filters:
+      - invert:  # Invert the signal
+
+  - platform: gpio
+    pin: 4
+    id: tank_sensor
+    internal: true
+
+    on_release:
+      then:
+        - if:
+            condition:
+              lambda: "return id(filling);"
+            then:
+              - switch.turn_off: water_valve
+              - lambda: |-
+                  id(filling) = false;
+                  ESP_LOGW("custom", "Tank removed! Water flow stopped.");
+
+# Coffee machine state indicator 
+  - platform: gpio
+    pin: 1
+    name: "Coffee Machine Indicator"
+    id: coffee_indicator
+    on_state:
+      - lambda: |-
+          id(coffee_machine_power).publish_state(id(coffee_indicator).state);
+
+# Coffee machine power control (momentary button simulation)
+switch:
+  - platform: template
+    name: "Coffee Machine Power"
+    id: coffee_machine_power
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - if:
+          condition:
+            binary_sensor.is_off: coffee_indicator
+          then:
+            - output.turn_on: coffee_button
+            - delay: 100ms
+            - output.turn_off: coffee_button
+    turn_off_action:
+      - if:
+          condition:
+            binary_sensor.is_on: coffee_indicator
+          then:
+            - output.turn_on: coffee_button
+            - delay: 100ms
+            - output.turn_off: coffee_button
+
+# Reset button for fill counters 
+  - platform: template
+    name: "Reset Counters"
+    id: reset_counters
+    turn_on_action:
+      - lambda: |-
+          id(total_fills) = 0;
+          id(total_liters) = 0.0;
+          id(fill_count).publish_state(0);
+          id(total_liters_sensor).publish_state(0.0);
+          ESP_LOGI("custom", "Counters reset.");
+
+# Water valve relay 
+  - platform: gpio
+    pin: 10
+    id: water_valve
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+# Output control for coffee machine button
+output:
+  - platform: gpio
+    pin: 0
+    id: coffee_button
+
+# Fill cycle counters
+sensor:
+  - platform: template
+    name: "Fill Count"
+    id: fill_count
+    accuracy_decimals: 0
+    unit_of_measurement: "times"
+    lambda: |-
+      return id(total_fills);
+
+  - platform: template
+    name: "Total Water Volume"
+    id: total_liters_sensor
+    accuracy_decimals: 2
+    unit_of_measurement: "L"
+    lambda: |-
+      return id(total_liters);
+ 
+# Combined interval block for boot delay and water filling logic
+interval:
+  - interval: 1000ms
+    then:
+      # Boot delay: complete after 5 seconds
+      - if:
+          condition:
+            lambda: "return !id(boot_delay_complete) && (millis() >= 5000);"
+          then:
+            - lambda: |-
+                id(boot_delay_complete) = true;
+                ESP_LOGI("custom", "Boot delay complete.");
+      
+      # Water filling logic (starts only if boot delay is complete)
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: tank_sensor
+              - binary_sensor.is_on: lower_sensor   # Filling starts only if lower sensor is triggered
+              - binary_sensor.is_off: upper_sensor
+              - lambda: "return id(boot_delay_complete) && !id(filling) && !id(error_state);"
+          then:
+            - delay: 2000ms  # Delay before starting water fill
+            - switch.turn_on: water_valve
+            - lambda: |-
+                id(start_time) = millis();
+                id(filling) = true;
+                ESP_LOGI("custom", "Water filling started.");
+      - if:
+          condition:
+            or:
+              - binary_sensor.is_on: upper_sensor  # Upper level reached
+              - lambda: "return id(filling) && (millis() - id(start_time) >= 45000);"  # Timeout
+          then:
+            - switch.turn_off: water_valve
+            - lambda: |-
+                if (id(filling)) {
+                  if (id(upper_sensor).state) {  
+                    id(total_fills) += 1;
+                    id(total_liters) += 1.05; 
+                    id(fill_count).publish_state(id(total_fills));
+                    id(total_liters_sensor).publish_state(id(total_liters));
+                    ESP_LOGI("custom", "Fill completed. Total fills: %d, Total volume: %.2f L", 
+                      id(total_fills), id(total_liters));
+                  } else {
+                    id(error_state) = true;
+                    ESP_LOGW("custom", "Emergency shutdown! Valve locked.");
+                  }
+                  id(filling) = false;
+                }
